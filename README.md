@@ -67,7 +67,7 @@ You may also want to run `onsm syscheck` which will dump some info about your sy
 
 When you run onsm classify or onsm reuse, three main result files are created in the output directory:
 
-### `classification.tsv`
+### `classification.tsv`
 
 This is the main call table. Each row corresponds to one candidate locus (a mito↔nuclear alignment pair).
 Columns:
