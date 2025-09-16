@@ -98,42 +98,6 @@ pub mod mapping {
         Ok((mm2, sam))
     }
 
-    pub fn resolve_minimap2(opt: Option<&Path>) -> Result<std::path::PathBuf> {
-        if let Some(p) = opt {
-            if p.exists() {
-                return Ok(p.to_path_buf());
-            } else {
-                return Err(anyhow!("minimap2 not found at {:?}", p));
-            }
-        }
-        if let Ok(envp) = std::env::var("ONSM_MINIMAP2") {
-            return Ok(std::path::PathBuf::from(envp));
-        }
-        which::which("minimap2")
-            .map_err(|_| anyhow!("minimap2 not found (set --minimap2, ONSM_MINIMAP2, or PATH)"))
-    }
-
-    pub fn build_index(
-        mm2_bin: &Path,
-        fasta: &Path,
-        out_mmi: &Path,
-        force: bool,
-        _threads: usize,
-    ) -> Result<()> {
-        if out_mmi.exists() && !force {
-            return Ok(());
-        }
-        let status = Command::new(mm2_bin)
-            .args(["-d"])
-            .arg(out_mmi)
-            .arg(fasta)
-            .status()?;
-        if !status.success() {
-            return Err(anyhow!("minimap2 index build failed"));
-        }
-        Ok(())
-    }
-
     pub fn map_asm_to_asm(
         mm2_bin: &Path,
         query_fa: &Path,
