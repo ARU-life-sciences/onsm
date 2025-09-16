@@ -3,6 +3,7 @@
 use anyhow::{anyhow, Result};
 use clap::Args;
 use fs_err as fs;
+use std::collections::HashSet;
 use std::path::PathBuf;
 
 use crate::io::{bam, fasta, paf, runfiles};
@@ -68,6 +69,12 @@ pub struct CmdClassify {
     pub call_threshold: f32,
     #[arg(long, default_value_t = 0.30)]
     pub highconf_threshold: f32,
+    #[arg(
+        long,
+        default_value_t = false,
+        help = "Keep nuclear contigs that look like full mito assemblies"
+    )]
+    pub allow_organelle_in_nuclear: bool,
 }
 
 impl CmdClassify {
@@ -152,7 +159,46 @@ impl CmdClassify {
         // 3) Parse PAF, merge HSPs into loci
         let m2n_records = paf::read_paf(&paf_m2n, self.min_id, self.min_len)?;
         let n2m_records = paf::read_paf(&paf_n2m, self.min_id, self.min_len)?;
-        let pairs = paf::pair_and_merge(m2n_records, n2m_records, self.merge_gap)?;
+        let pairs0 = paf::pair_and_merge(&m2n_records, n2m_records, self.merge_gap)?;
+
+        // 3.5) Exclude nuclear contigs that are essentially the mito assembly duplicated inside nuclear
+        // (unless explicitly allowed via --allow-organelle-in-nuclear).
+        let pairs = if self.allow_organelle_in_nuclear {
+            log::warn!(
+                "Keeping organelle-like nuclear contigs by request (--allow-organelle-in-nuclear)."
+            );
+            pairs0
+        } else {
+            // Detect organelle-like nuclear contigs from mito→nuclear hits
+            let mito_lens = crate::summary::contig_lengths(&self.mito)?;
+            let nuc_lens = crate::summary::contig_lengths(&self.nuclear)?;
+            let flagged: HashSet<String> =
+                paf::detect_organelle_in_nuclear(&m2n_records, &mito_lens, &nuc_lens);
+
+            if !flagged.is_empty() {
+                log::warn!(
+                    "Excluding {} nuclear contig(s) that look like full mito assemblies: {}{}",
+                    flagged.len(),
+                    flagged
+                        .iter()
+                        .take(5)
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    if flagged.len() > 5 { ", …" } else { "" }
+                );
+                // optional: write them to disk for provenance
+                fs::write(
+                    self.out.join("excluded_organelle_like_nuclear_contigs.txt"),
+                    flagged.iter().cloned().collect::<Vec<_>>().join("\n"),
+                )?;
+            }
+
+            pairs0
+                .into_iter()
+                .filter(|p| !flagged.contains(&p.nuc_contig))
+                .collect()
+        };
 
         // 4) Coverage & spans
         let (coverage, spans) = bam::compute_coverage_and_spans_with_tools(

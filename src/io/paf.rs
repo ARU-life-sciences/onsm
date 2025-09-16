@@ -4,7 +4,7 @@
 
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
-use std::path::Path;
+use std::{collections::HashMap, path::Path};
 
 /// Thin, crate-internal alignment record used by downstream code.
 /// Constructed from `paf::PafRecord`.
@@ -84,7 +84,7 @@ pub struct PairedLocus {
 /// nuclear→mito hit with swapped contig names; pick the best by identity.
 /// (You can enrich this later with chaining/merging and gap handling.)
 pub fn pair_and_merge(
-    m2n: Vec<PafRecord>,
+    m2n: &Vec<PafRecord>,
     n2m: Vec<PafRecord>,
     _merge_gap: u32,
 ) -> Result<Vec<PairedLocus>> {
@@ -141,6 +141,33 @@ pub fn default_embed_stub(pairs: &[PairedLocus]) -> Vec<(String, EmbedFeatures)>
         .iter()
         .map(|p| (p.pair_id.clone(), EmbedFeatures::default()))
         .collect()
+}
+
+/// Return set of nuclear contigs that are effectively the mito assembly duplicated in nuclear.
+pub fn detect_organelle_in_nuclear(
+    mito_to_nuc_hits: &[PafRecord], // your parsed PAF records (mito -> nuclear)
+    mito_lengths: &HashMap<String, u64>,
+    nuc_lengths: &HashMap<String, u64>,
+) -> std::collections::HashSet<String> {
+    use std::collections::HashSet;
+    let mut flagged = HashSet::new();
+
+    for h in mito_to_nuc_hits {
+        let qlen = *mito_lengths.get(&h.qname).unwrap_or(&0);
+        let tlen = *nuc_lengths.get(&h.tname).unwrap_or(&0);
+        if qlen == 0 || tlen == 0 {
+            continue;
+        }
+
+        let cov = (h.alnlen as f32) / (qlen as f32);
+        let ident = h.identity; // already 0..1 in the parser
+        let size_ratio = (tlen as f32) / (qlen as f32);
+
+        if ident >= 0.995 && cov >= 0.95 && (0.8..=1.2).contains(&size_ratio) {
+            flagged.insert(h.tname.clone()); // nuclear contig name
+        }
+    }
+    flagged
 }
 
 #[cfg(test)]
