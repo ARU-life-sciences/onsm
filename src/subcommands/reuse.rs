@@ -36,7 +36,7 @@ pub struct CmdReuse {
     #[arg(long, value_parser=["hifi","ont"])]
     pub platform: String,
     #[arg(long)]
-    pub samtools_bin: Option<PathBuf>,
+    pub samtools: Option<PathBuf>,
     #[arg(long)]
     pub paf_mito_to_nuc: PathBuf,
     #[arg(long)]
@@ -83,11 +83,11 @@ impl CmdReuse {
         fs::create_dir_all(&self.out)?;
 
         // resolve samtools path
-        let samtools_path: PathBuf = if let Some(p) = &self.samtools_bin {
+        let samtools_path: PathBuf = if let Some(p) = &self.samtools {
             p.clone()
         } else {
             which::which("samtools").map_err(|_| {
-                anyhow::anyhow!("samtools not found: pass --samtools-bin or add to PATH")
+                anyhow::anyhow!("samtools not found: pass --samtools or add to PATH")
             })?
         };
         log::info!("REUSE: using samtools at {}", samtools_path.display());
