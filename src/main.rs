@@ -1,22 +1,22 @@
-//! onsm: Organelle–Nuclear Similarity Mapper
-//! Entry point only; see `cli` and `subcommands/*`.
+use clap::{Parser, Subcommand};
 
-mod cli;
-mod io;
-mod model;
-mod scoring;
-mod subcommands;
-mod summary;
-mod util;
+#[derive(Parser)]
+#[command(name = "onsm", version, about = "Minimal NUMT/NIMT detector")]
+struct Cli {
+    #[command(subcommand)]
+    cmd: Cmd,
+}
 
-use anyhow::Result;
-use cli::Cli;
+#[derive(Subcommand)]
+enum Cmd {
+    Classify(onsm::subcommands::classify::CmdClassify),
+    Reuse(onsm::subcommands::reuse::CmdReuse),
+}
 
-fn main() -> Result<()> {
-    // Initialize env_logger with a default filter of "onsm=info"
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("onsm=info"))
-        .format_timestamp_millis()
-        .init();
-    let cli = <Cli as clap::Parser>::parse();
-    cli.run()
+fn main() -> anyhow::Result<()> {
+    let cli = Cli::parse();
+    match cli.cmd {
+        Cmd::Classify(cmd) => cmd.run(),
+        Cmd::Reuse(cmd) => cmd.run(),
+    }
 }

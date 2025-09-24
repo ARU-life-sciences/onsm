@@ -1,13 +1,11 @@
-//! PAF I/O using the `paf` crate (v0.2.1) + pairing/merging helpers.
-//
-// Public API kept identical to the previous scaffold so other modules don’t change.
-
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
+use paf::Reader as PafReader;
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, path::Path};
+use std::path::Path;
 
-/// Thin, crate-internal alignment record used by downstream code.
-/// Constructed from `paf::PafRecord`.
+use crate::model::PairedLocus;
+
+/// Thin, crate-internal PAF record (we compute identity here).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PafRecord {
     pub qname: String,
@@ -19,15 +17,15 @@ pub struct PafRecord {
     pub matches: u32,
     pub alnlen: u32,
     pub mapq: u8,
-    pub identity: f32, // computed as residue_matches / alignment_block_len
-    pub strand: char,  // '+' or '-'
+    pub identity: f32,
+    pub strand: char,
 }
 
 impl From<paf::PafRecord> for PafRecord {
     fn from(r: paf::PafRecord) -> Self {
         let matches = r.residue_matches();
         let alnlen = r.alignment_block_len();
-        let ident = if alnlen > 0 {
+        let identity = if alnlen > 0 {
             matches as f32 / alnlen as f32
         } else {
             0.0
@@ -42,54 +40,39 @@ impl From<paf::PafRecord> for PafRecord {
             matches,
             alnlen,
             mapq: r.mapping_quality(),
-            identity: ident,
+            identity,
             strand: r.strand(),
         }
     }
 }
 
-/// Read & filter a PAF file using `paf::Reader`.
+/// Read & filter PAF: keep records with identity ≥ min_id and length ≥ min_len.
 pub fn read_paf(path: &Path, min_id: f32, min_len: u32) -> Result<Vec<PafRecord>> {
     if !path.exists() {
-        return Err(anyhow!("PAF not found: {:?}", path));
+        return Err(anyhow!("PAF not found: {}", path.display()));
     }
-    let mut reader = paf::Reader::from_path(path)
-        .map_err(|e| anyhow!("Failed to open PAF {:?}: {}", path, e))?;
+    let mut reader =
+        PafReader::from_path(path).with_context(|| format!("open PAF {}", path.display()))?;
     let mut out = Vec::new();
     for rec in reader.records() {
-        let r = rec.map_err(|e| anyhow!("Error reading PAF record: {}", e))?;
-        let ours: PafRecord = r.into();
-        if ours.identity >= min_id && ours.alnlen >= min_len {
-            out.push(ours);
+        let r = rec.with_context(|| format!("read PAF record in {}", path.display()))?;
+        let pr: PafRecord = r.into();
+        if pr.identity >= min_id && pr.alnlen >= min_len {
+            out.push(pr);
         }
     }
     Ok(out)
 }
 
-/// Paired/merged locus (still minimal for v1).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PairedLocus {
-    pub pair_id: String,
-    pub nuc_contig: String,
-    pub nuc_start: u32,
-    pub nuc_end: u32,
-    pub mito_contig: String,
-    pub mito_start: u32,
-    pub mito_end: u32,
-    pub aln_len: u32,
-    pub aln_ident: f32,
-}
-
-/// Very simple v1 pairing: use mito→nuclear hits as the driver; try to find a reciprocal
-/// nuclear→mito hit with swapped contig names; pick the best by identity.
-/// (You can enrich this later with chaining/merging and gap handling.)
+/// Very simple pairing:
+/// drive by mito→nuclear records, look for best reciprocal nuclear→mito by swapped names.
 pub fn pair_and_merge(
-    m2n: &Vec<PafRecord>,
+    m2n: &[PafRecord],
     n2m: Vec<PafRecord>,
     _merge_gap: u32,
 ) -> Result<Vec<PairedLocus>> {
     let mut loci = Vec::new();
-    for (i, rec) in m2n.into_iter().enumerate() {
+    for (i, rec) in m2n.iter().enumerate() {
         let best = n2m
             .iter()
             .filter(|r| r.qname == rec.tname && r.tname == rec.qname)
@@ -100,7 +83,6 @@ pub fn pair_and_merge(
             .unwrap_or(rec.identity);
         let (mito_s, mito_e) = (rec.qstart.min(rec.qend), rec.qstart.max(rec.qend));
         let (nuc_s, nuc_e) = (rec.tstart.min(rec.tend), rec.tstart.max(rec.tend));
-
         loci.push(PairedLocus {
             pair_id: format!("P{:06}", i + 1),
             nuc_contig: rec.tname.clone(),
@@ -116,102 +98,41 @@ pub fn pair_and_merge(
     Ok(loci)
 }
 
-/// Embedding features placeholder (to be filled by short flank alignments later).
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct EmbedFeatures {
-    pub f_nuc_embed: f32,
-    pub f_mito_embed: f32,
-}
-
-pub fn compute_embedding_identities(
-    pairs: &[PairedLocus],
-    _mito: &std::path::Path,
-    _nuclear: &std::path::Path,
-    _flank: u32,
-    _threads: usize,
-) -> Result<Vec<(String, EmbedFeatures)>> {
-    Ok(pairs
-        .iter()
-        .map(|p| (p.pair_id.clone(), EmbedFeatures::default()))
-        .collect())
-}
-
-pub fn default_embed_stub(pairs: &[PairedLocus]) -> Vec<(String, EmbedFeatures)> {
-    pairs
-        .iter()
-        .map(|p| (p.pair_id.clone(), EmbedFeatures::default()))
-        .collect()
-}
-
-/// Return set of nuclear contigs that are effectively the mito assembly duplicated in nuclear.
-pub fn detect_organelle_in_nuclear(
-    mito_to_nuc_hits: &[PafRecord], // your parsed PAF records (mito -> nuclear)
-    mito_lengths: &HashMap<String, u64>,
-    nuc_lengths: &HashMap<String, u64>,
-) -> std::collections::HashSet<String> {
-    use std::collections::HashSet;
-    let mut flagged = HashSet::new();
-
-    for h in mito_to_nuc_hits {
-        let qlen = *mito_lengths.get(&h.qname).unwrap_or(&0);
-        let tlen = *nuc_lengths.get(&h.tname).unwrap_or(&0);
-        if qlen == 0 || tlen == 0 {
-            continue;
-        }
-
-        let cov = (h.alnlen as f32) / (qlen as f32);
-        let ident = h.identity; // already 0..1 in the parser
-        let size_ratio = (tlen as f32) / (qlen as f32);
-
-        if ident >= 0.995 && cov >= 0.95 && (0.8..=1.2).contains(&size_ratio) {
-            flagged.insert(h.tname.clone()); // nuclear contig name
-        }
-    }
-    flagged
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use paf::{PafRecord as RPafRecord, Tag, Type, Writer};
+    use paf::{PafRecord as R, Tag, Type, Writer};
     use std::collections::HashMap;
     use tempfile::NamedTempFile;
 
     #[test]
-    fn roundtrip_read_with_paf_crate() {
-        // Write a tiny PAF using the crate’s Writer, then read via our read_paf
+    fn read_filter_roundtrip() {
         let tmp = NamedTempFile::new().unwrap();
         {
             let mut w = Writer::from_path(tmp.path()).unwrap();
             let mut opt = HashMap::new();
             opt.insert("tp".to_string(), Tag::tp(Type::Char('P')));
-            // 390/500 = 0.78 identity
-            let rec = RPafRecord::new(
-                "q1".to_string(),
+            // matches=90, alnlen=100 → 0.9
+            let rec = R::new(
+                "mito1".to_string(),
                 1000,
-                10,
-                510,
-                '+',
-                "t1".to_string(),
-                2000,
+                0,
                 100,
-                600,
-                390,
-                500,
+                '+',
+                "chr1".to_string(),
+                5000,
+                1000,
+                1100,
+                90,
+                100,
                 60,
                 opt,
             );
             w.write_record(&rec).unwrap();
         }
-
-        let v = read_paf(tmp.path(), 0.75, 100).unwrap();
+        let v = read_paf(tmp.path(), 0.90, 50).unwrap();
         assert_eq!(v.len(), 1);
-        assert_eq!(v[0].qname, "q1");
-        assert_eq!(v[0].tname, "t1");
-        assert!((v[0].identity - 0.78).abs() < 1e-6);
-
-        // Apply a stricter filter that drops it
-        let v2 = read_paf(tmp.path(), 0.80, 100).unwrap();
-        assert!(v2.is_empty());
+        assert_eq!(v[0].qname, "mito1");
+        assert_eq!(v[0].tname, "chr1");
     }
 }

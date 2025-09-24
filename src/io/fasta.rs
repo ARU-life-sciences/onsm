@@ -1,42 +1,50 @@
-//! FASTA validation with transparent .gz support via needletail.
-//!
-//! Accepts .fa/.fasta and .fa.gz/.fasta.gz. We just sanity-check that the file
-//! exists and contains at least one sequence record parsable as FASTA-like
-//! (needletail's parser handles gz internally).
-
-use anyhow::{anyhow, Result};
-use fs_err as fs;
+use anyhow::{Context, Result};
 use needletail::parse_fastx_file;
+use std::collections::HashMap;
 use std::path::Path;
 
-pub fn validate_fasta(path: &Path) -> Result<()> {
-    if !path.exists() {
-        return Err(anyhow!("FASTA not found: {:?}", path));
+/// Checks file exists, is readable, and looks like FASTA by reading first record.
+pub fn validate_fasta(p: &Path) -> Result<()> {
+    if !p.exists() {
+        return Err(anyhow::anyhow!("FASTA not found: {}", p.display()));
     }
-
-    // Quick guard against empty files (saves a confusing parser error).
-    let meta = fs::metadata(path)?;
-    if meta.len() == 0 {
-        return Err(anyhow!("FASTA is empty: {:?}", path));
-    }
-
-    let mut reader =
-        parse_fastx_file(path).map_err(|e| anyhow!("failed to open FASTA {:?}: {}", path, e))?;
-
-    // Read the first record to verify it's a FASTA-like record (parser succeeds).
-    let mut saw_record = false;
-    while let Some(res) = reader.next() {
-        let rec = res.map_err(|e| anyhow!("failed to read FASTA record in {:?}: {}", path, e))?;
-        // A sequence of nonzero length is good enough for validation here.
-        if !rec.seq().is_empty() {
-            saw_record = true;
-            break;
-        }
-    }
-
-    if !saw_record {
-        return Err(anyhow!("FASTA appears to contain no sequences: {:?}", path));
-    }
-
+    let mut rdr = parse_fastx_file(p).with_context(|| format!("open fasta {}", p.display()))?;
+    let _ = rdr
+        .next()
+        .transpose()
+        .with_context(|| format!("read first record in {}", p.display()))?;
     Ok(())
+}
+
+/// Returns map of contig name -> length (bp).
+pub fn contig_lengths(p: &Path) -> Result<HashMap<String, u64>> {
+    let mut m = HashMap::new();
+    let mut rdr = parse_fastx_file(p).with_context(|| format!("open fasta {}", p.display()))?;
+    while let Some(rec) = rdr
+        .next()
+        .transpose()
+        .with_context(|| format!("read fasta {}", p.display()))?
+    {
+        let id = String::from_utf8_lossy(rec.id()).to_string();
+        let len = rec.seq().len() as u64;
+        m.insert(id, len);
+    }
+    Ok(m)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use tempfile::NamedTempFile;
+
+    #[test]
+    fn lengths_ok() {
+        let mut f = NamedTempFile::new().unwrap();
+        writeln!(f, ">c1\nAAAAAA\n>c2\nACGTACGTAC\n>c3\nA\n").unwrap();
+        let m = contig_lengths(f.path()).unwrap();
+        assert_eq!(m.get("c1"), Some(&6));
+        assert_eq!(m.get("c2"), Some(&10));
+        assert_eq!(m.get("c3"), Some(&1));
+    }
 }

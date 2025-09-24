@@ -1,249 +1,140 @@
-//! BAM coverage & spanning-read metrics using noodles (bam 0.83, sam 0.79).
-//! Requires BAM + BAI next to the BAM.
-
-use anyhow::Result;
-use noodles_sam::alignment::record::cigar::op::Kind;
-use noodles_sam::alignment::record::MappingQuality;
+use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::path::Path;
-
-use crate::io::paf::PairedLocus;
-
 use std::process::Command;
-use tempfile::tempdir;
 
-const SPAN_CAP_BP: i32 = 20_000;
+use crate::model::{CoverageSummary, PairedLocus, SpanSummary};
 
-/// Overall coverage medians + per-pair local depths.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct CoverageSummary {
-    pub nuclear_median: f64,
-    pub mito_median: f64,
-    /// pair_id -> (D_nuc_loc, D_mito_loc)
-    pub per_pair: HashMap<String, (f32, f32)>,
+/// Half-open window on reference in 0-based coordinates [start, end).
+#[derive(Debug, Clone, Copy)]
+pub struct Window {
+    pub start: i32,
+    pub end: i32,
 }
 
-/// Per-pair spanning support fractions.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
-pub struct SpanSummary {
-    /// pair_id -> (S_nuc_span, S_mito_span)
-    pub per_pair: HashMap<String, (f32, f32)>,
+fn region_str(rname: &str, w: Window) -> String {
+    // samtools uses 1-based inclusive coordinates
+    let s1 = (w.start.max(0) + 1) as usize;
+    let e1 = w.end.max(w.start + 1) as usize;
+    format!("{rname}:{s1}-{e1}")
 }
 
-#[derive(Clone, Copy)]
-struct Window {
-    start: i32, // 0-based inclusive
-    end: i32,   // 0-based exclusive
+fn parse_cigar_ref_consumed(cigar: &str) -> Option<u32> {
+    // Sum of ref-consuming ops: M, =, X, D, N
+    let mut num = 0u64;
+    let mut acc = 0u64;
+    for ch in cigar.bytes() {
+        match ch {
+            b'0'..=b'9' => {
+                num = num * 10 + (ch - b'0') as u64;
+            }
+            b'M' | b'=' | b'X' | b'D' | b'N' => {
+                acc = acc.saturating_add(num);
+                num = 0;
+            }
+            b'I' | b'S' | b'H' | b'P' => {
+                num = 0;
+            }
+            _ => return None, // malformed
+        }
+    }
+    Some(acc.min(u32::MAX as u64) as u32)
 }
 
-fn avg_depth_for_region_path_with_samtools(
-    bam_path: &Path,
-    rname: &str,
-    window: Window,
-    samtools_bin: &Path,
-) -> Result<f32> {
-    let s1 = (window.start.max(0) + 1) as usize;
-    let e1 = window.end.max(1) as usize;
-    let region = format!("{rname}:{s1}-{e1}");
+fn median_f32(mut v: Vec<f32>) -> f32 {
+    if v.is_empty() {
+        return 0.0;
+    }
+    v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let n = v.len();
+    if n % 2 == 1 {
+        v[n / 2]
+    } else {
+        0.5 * (v[n / 2 - 1] + v[n / 2])
+    }
+}
 
-    let dir = tempdir()?;
-    let out_path = dir.path().join("slice.bam");
-
-    let output = Command::new(samtools_bin)
-        .args(["view", "-b", "-o"])
-        .arg(&out_path)
-        .arg(bam_path)
+/// Compute local median depth in a region using `samtools depth`.
+fn local_median_depth(samtools: &Path, bam: &Path, rname: &str, w: Window) -> Result<f32> {
+    let region = region_str(rname, w);
+    let out = Command::new(samtools)
+        .args(["depth", "-r"])
         .arg(&region)
+        .arg(bam)
         .output()
-        .map_err(|e| anyhow::anyhow!("failed to spawn {} view: {}", samtools_bin.display(), e))?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(anyhow::anyhow!(
-            "samtools view failed for region {} on {}: {}",
-            region,
-            bam_path.display(),
-            stderr.trim()
-        ));
+        .with_context(|| format!("spawn samtools depth for {region}"))?;
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr);
+        return Err(anyhow::anyhow!("samtools depth failed: {}", err.trim()));
     }
-
-    let meta = fs_err::metadata(&out_path)
-        .map_err(|e| anyhow::anyhow!("slice not created for {}: {}", region, e))?;
-    if meta.len() == 0 {
-        return Ok(0.0);
-    }
-
-    let mut reader = noodles_bam::io::Reader::new(fs_err::File::open(&out_path)?);
-    let _header = reader.read_header()?;
-
-    let win_len = (window.end - window.start).max(1) as i64;
-    let mut covered: i64 = 0;
-
-    for result in reader.records() {
-        let record = result?;
-        if record.flags().is_unmapped() {
-            continue;
-        }
-
-        let rec_start0 = match record.alignment_start() {
-            Some(Ok(p)) => (usize::from(p) as i32 - 1).max(0),
-            _ => continue,
-        };
-
-        let mut ref_len = 0i32;
-        for op in record.cigar().iter() {
-            let op = op?;
-            match op.kind() {
-                Kind::Match
-                | Kind::SequenceMatch
-                | Kind::SequenceMismatch
-                | Kind::Deletion
-                | Kind::Skip => ref_len += i32::try_from(op.len()).unwrap_or(0),
-                _ => {}
-            }
-        }
-        if ref_len <= 0 {
-            continue;
-        }
-        let rec_end0 = rec_start0 + ref_len;
-
-        let ov_start = rec_start0.max(window.start);
-        let ov_end = rec_end0.min(window.end);
-        if ov_end <= ov_start {
-            continue;
-        }
-
-        let mut ref_pos = rec_start0;
-        for op in record.cigar().iter() {
-            let op = op?;
-            let oplen = i32::try_from(op.len()).unwrap_or(0);
-            let consumes_ref = matches!(
-                op.kind(),
-                Kind::Match
-                    | Kind::SequenceMatch
-                    | Kind::SequenceMismatch
-                    | Kind::Deletion
-                    | Kind::Skip
-            );
-            let contributes = matches!(
-                op.kind(),
-                Kind::Match | Kind::SequenceMatch | Kind::SequenceMismatch
-            );
-            if consumes_ref {
-                let seg_start = ref_pos;
-                let seg_end = ref_pos + oplen;
-                if contributes {
-                    let s = seg_start.max(ov_start);
-                    let e = seg_end.min(ov_end);
-                    if e > s {
-                        covered += (e - s) as i64;
-                    }
-                }
-                ref_pos += oplen;
+    // depth output: chrom  pos  depth
+    let mut depths = Vec::new();
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+        let mut it = line.split_whitespace();
+        let _chrom = it.next();
+        let _pos = it.next();
+        if let Some(d) = it.next() {
+            if let Ok(x) = d.parse::<u32>() {
+                depths.push(x as f32);
             }
         }
     }
-
-    Ok((covered as f32) / (win_len as f32))
+    Ok(median_f32(depths))
 }
 
-fn span_fraction_for_region_path_with_samtools(
-    bam_path: &Path,
-    rname: &str,
-    window: Window, // full candidate window (can be huge)
-    samtools_bin: &Path,
-    span_cap_bp: i32, // NEW: cap for span check, e.g. 20_000
-) -> Result<f32> {
-    const MIN_FRAC: f32 = 0.80;
+/// Fraction of alignments that span the entire [w.start, w.end) window on rname.
+/// Uses `samtools view` (SAM text), MAPQ ≥ 20.
+fn span_fraction(samtools: &Path, bam: &Path, rname: &str, w: Window) -> Result<f32> {
     const MIN_MAPQ: u8 = 20;
-
-    // Build a capped window around the midpoint for the span calculation
-    let mid = (window.start + window.end) / 2;
-    let half = (span_cap_bp / 2).max(1);
-    let span_w = Window {
-        start: (mid - half).max(0),
-        end: mid + half,
-    };
-
-    // Slice only the capped region (faster than slicing the full mega-window)
-    let s1 = (span_w.start.max(0) + 1) as usize; // 1-based inclusive
-    let e1 = span_w.end.max(1) as usize;
-    let region = format!("{rname}:{s1}-{e1}");
-
-    let dir = tempdir()?;
-    let out_path = dir.path().join("slice.bam");
-
-    let output = Command::new(samtools_bin)
-        .args(["view", "-b", "-o"])
-        .arg(&out_path)
-        .arg(bam_path)
+    let region = region_str(rname, w);
+    let out = Command::new(samtools)
+        .args(["view"])
+        .arg(bam)
         .arg(&region)
         .output()
-        .map_err(|e| anyhow::anyhow!("failed to spawn {} view: {}", samtools_bin.display(), e))?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(anyhow::anyhow!(
-            "samtools view failed for region {} on {}: {}",
-            region,
-            bam_path.display(),
-            stderr.trim()
-        ));
+        .with_context(|| format!("spawn samtools view for {region}"))?;
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr);
+        return Err(anyhow::anyhow!("samtools view failed: {}", err.trim()));
     }
+    let s1 = w.start.max(0) + 1; // window start 1-based
+    let e1 = w.end.max(w.start + 1); // window end 1-based inclusive-ish
 
-    let meta = fs_err::metadata(&out_path)
-        .map_err(|e| anyhow::anyhow!("slice not created for {}: {}", region, e))?;
-    if meta.len() == 0 {
-        return Ok(0.0);
-    }
-
-    let mut reader = noodles_bam::io::Reader::new(fs_err::File::open(&out_path)?);
-    let _header = reader.read_header()?;
-
-    let win_len = (span_w.end - span_w.start).max(1) as f32; // use capped window length
     let mut total = 0f32;
     let mut spans = 0f32;
 
-    for result in reader.records() {
-        let record = result?;
-        if record.flags().is_unmapped() {
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+        if line.is_empty() || line.starts_with('@') {
             continue;
         }
-        if let Some(q) = record.mapping_quality() {
-            if q < MappingQuality::new(MIN_MAPQ).unwrap() {
-                continue;
-            }
+        let mut cols = line.split('\t');
+        let _qname = cols.next();
+        let flag = cols.next().and_then(|s| s.parse::<u16>().ok()).unwrap_or(0);
+        let rname_sam = cols.next().unwrap_or("*");
+        let pos = cols.next().and_then(|s| s.parse::<i32>().ok()).unwrap_or(0);
+        let mapq = cols.next().and_then(|s| s.parse::<u8>().ok()).unwrap_or(0);
+        let cigar = cols.next().unwrap_or("*");
+
+        // filter
+        if (flag & 0x4) != 0 {
+            continue; // unmapped
+        }
+        if mapq < MIN_MAPQ {
+            continue;
+        }
+        if rname_sam != rname {
+            continue;
         }
 
-        // 1-based -> 0-based
-        let rec_start0 = match record.alignment_start() {
-            Some(Ok(p)) => (usize::from(p) as i32 - 1).max(0),
+        let ref_len = match parse_cigar_ref_consumed(cigar) {
+            Some(x) if x > 0 => x as i32,
             _ => continue,
         };
-
-        // Reference span from ref-consuming CIGAR ops
-        let mut ref_len = 0i32;
-        for op in record.cigar().iter() {
-            let op = op?;
-            match op.kind() {
-                Kind::Match
-                | Kind::SequenceMatch
-                | Kind::SequenceMismatch
-                | Kind::Deletion
-                | Kind::Skip => ref_len += i32::try_from(op.len()).unwrap_or(0),
-                _ => {}
-            }
-        }
-        if ref_len <= 0 {
-            continue;
-        }
-        let rec_end0 = rec_start0 + ref_len;
-
-        // Overlap against the **capped** span window
-        let ov_start = rec_start0.max(span_w.start);
-        let ov_end = rec_end0.min(span_w.end);
-        let overlap = (ov_end - ov_start).max(0) as f32;
+        let rec_start = pos; // POS is 1-based
+        let rec_end = pos + ref_len - 1; // inclusive on reference
 
         total += 1.0;
-        if overlap / win_len >= MIN_FRAC {
+        if rec_start <= s1 && rec_end >= e1 {
             spans += 1.0;
         }
     }
@@ -251,113 +142,112 @@ fn span_fraction_for_region_path_with_samtools(
     Ok(if total == 0.0 { 0.0 } else { spans / total })
 }
 
+/// Compute (coverage, spans) for all pairs using small windows around each locus.
+/// Global medians are computed as the median of per-pair local medians (robust & fast).
 pub fn compute_coverage_and_spans_with_tools(
-    bam_r2n: &Path,
-    bam_r2m: &Path,
+    bam_reads_to_nuc: &Path,
+    bam_reads_to_mito: &Path,
     pairs: &[PairedLocus],
     flank: u32,
-    _win_bp: u32,
-    samtools_bin: &Path,
+    win: u32,
+    samtools: &Path,
 ) -> Result<(CoverageSummary, SpanSummary)> {
-    use std::time::Instant;
-    let t0 = Instant::now();
     log::info!(
         "BAM: computing coverage & spans for {} pairs (flank={} bp) using samtools={}",
         pairs.len(),
         flank,
-        samtools_bin.display()
+        samtools.display()
     );
 
-    let mut per_pair = std::collections::HashMap::new();
-    let mut per_span = std::collections::HashMap::new();
-    let mut nuc_locals = Vec::with_capacity(pairs.len());
-    let mut mito_locals = Vec::with_capacity(pairs.len());
+    let mut per_pair_depth: HashMap<String, (f32, f32)> = HashMap::new();
+    let mut per_pair_span: HashMap<String, (f32, f32)> = HashMap::new();
 
-    let n = pairs.len().max(1);
-    let mut last_tick = Instant::now();
+    let mut nuc_locals = Vec::new();
+    let mut mito_locals = Vec::new();
+
+    let flank_i = flank as i32;
+    let win_i = win as i32;
 
     for (i, p) in pairs.iter().enumerate() {
-        let nuc_w = Window {
-            start: p.nuc_start as i32 - flank as i32,
-            end: p.nuc_end as i32 + flank as i32,
-        };
-        let mito_w = Window {
-            start: p.mito_start as i32 - flank as i32,
-            end: p.mito_end as i32 + flank as i32,
-        };
-
-        let d_nuc =
-            avg_depth_for_region_path_with_samtools(bam_r2n, &p.nuc_contig, nuc_w, samtools_bin)?;
-        let d_mito =
-            avg_depth_for_region_path_with_samtools(bam_r2m, &p.mito_contig, mito_w, samtools_bin)?;
-        let s_nuc = span_fraction_for_region_path_with_samtools(
-            bam_r2n,
-            &p.nuc_contig,
-            nuc_w,
-            samtools_bin,
-            SPAN_CAP_BP,
-        )?;
-        let s_mito = span_fraction_for_region_path_with_samtools(
-            bam_r2m,
-            &p.mito_contig,
-            mito_w,
-            samtools_bin,
-            SPAN_CAP_BP,
-        )?;
-
-        per_pair.insert(p.pair_id.clone(), (d_nuc, d_mito));
-        per_span.insert(p.pair_id.clone(), (s_nuc, s_mito));
-        nuc_locals.push(d_nuc);
-        mito_locals.push(d_mito);
-
-        if last_tick.elapsed().as_secs_f32() > 2.0 {
-            let done = i + 1;
-            let frac = (done as f32) / (n as f32);
-            let elapsed = t0.elapsed().as_secs_f32();
-            let eta = if frac > 0.0 {
-                elapsed * (1.0 - frac) / frac
-            } else {
-                f32::INFINITY
-            };
-            log::info!(
-                "BAM: {}/{} pairs ({:.0}%) processed, elapsed {:.1}s, ETA ~{:.1}s",
-                done,
-                n,
-                100.0 * frac,
-                elapsed,
-                eta
-            );
-            last_tick = Instant::now();
+        if (i + 1) % 50 == 0 || i == 0 {
+            log::info!("BAM: {}/{} …", i + 1, pairs.len());
         }
+
+        // Center windows at the alignment midpoints
+        let n_mid = ((p.nuc_start + p.nuc_end) / 2) as i32;
+        let m_mid = ((p.mito_start + p.mito_end) / 2) as i32;
+        let n_w = Window {
+            start: n_mid - flank_i,
+            end: n_mid + flank_i,
+        };
+        let m_w = Window {
+            start: m_mid - flank_i,
+            end: m_mid + flank_i,
+        };
+
+        // Local depths
+        let d_n = local_median_depth(samtools, bam_reads_to_nuc, &p.nuc_contig, n_w)?;
+        let d_m = local_median_depth(samtools, bam_reads_to_mito, &p.mito_contig, m_w)?;
+        per_pair_depth.insert(p.pair_id.clone(), (d_n, d_m));
+        nuc_locals.push(d_n);
+        mito_locals.push(d_m);
+
+        // Spanning windows: tighten to ±win around mid (must fully cover)
+        let n_s = Window {
+            start: n_mid - win_i,
+            end: n_mid + win_i,
+        };
+        let m_s = Window {
+            start: m_mid - win_i,
+            end: m_mid + win_i,
+        };
+        let s_n = span_fraction(samtools, bam_reads_to_nuc, &p.nuc_contig, n_s)?;
+        let s_m = span_fraction(samtools, bam_reads_to_mito, &p.mito_contig, m_s)?;
+        per_pair_span.insert(p.pair_id.clone(), (s_n, s_m));
     }
 
-    fn median(v: &mut [f32]) -> f64 {
-        if v.is_empty() {
-            return 0.0;
-        }
-        v.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        let m = v.len();
-        if m % 2 == 1 {
-            v[m / 2] as f64
-        } else {
-            (v[m / 2 - 1] as f64 + v[m / 2] as f64) / 2.0
-        }
-    }
-    let mut nt = nuc_locals.clone();
-    let mut mt = mito_locals.clone();
-    let cov = CoverageSummary {
-        nuclear_median: median(&mut nt),
-        mito_median: median(&mut mt),
-        per_pair,
-    };
-    let spans = SpanSummary { per_pair: per_span };
+    let nuclear_median = super::bam::median_f32(nuc_locals) as f64;
+    let mito_median = super::bam::median_f32(mito_locals) as f64;
 
-    log::info!(
-        "BAM: finished {} pairs in {:.1}s (medians: nuclear={:.3}, mito={:.3})",
-        n,
-        t0.elapsed().as_secs_f32(),
-        cov.nuclear_median,
-        cov.mito_median
-    );
-    Ok((cov, spans))
+    Ok((
+        CoverageSummary {
+            nuclear_median,
+            mito_median,
+            per_pair: per_pair_depth,
+        },
+        SpanSummary {
+            per_pair: per_pair_span,
+        },
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cigar_ref_len_parses_basic() {
+        assert_eq!(parse_cigar_ref_consumed("100M"), Some(100));
+        assert_eq!(parse_cigar_ref_consumed("10S90M"), Some(90));
+        assert_eq!(parse_cigar_ref_consumed("50M10I40M"), Some(90));
+        assert_eq!(parse_cigar_ref_consumed("50M5D45M"), Some(100));
+        assert_eq!(parse_cigar_ref_consumed("50M100N50M"), Some(200)); // spliced
+        assert_eq!(parse_cigar_ref_consumed("*"), None);
+    }
+
+    #[test]
+    fn median_works() {
+        assert_eq!(median_f32(vec![]), 0.0);
+        assert_eq!(median_f32(vec![1.0]), 1.0);
+        assert_eq!(median_f32(vec![1.0, 3.0]), 2.0);
+        assert_eq!(median_f32(vec![1.0, 3.0, 2.0]), 2.0);
+    }
+
+    #[test]
+    fn region_format_ok() {
+        let r = region_str("chr1", Window { start: 0, end: 10 });
+        assert_eq!(r, "chr1:1-10");
+        let r = region_str("chr1", Window { start: 9, end: 20 });
+        assert_eq!(r, "chr1:10-20");
+    }
 }
